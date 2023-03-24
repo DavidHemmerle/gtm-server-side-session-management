@@ -1,4 +1,12 @@
-﻿___INFO___
+﻿___TERMS_OF_SERVICE___
+
+By creating or modifying this file you agree to Google Tag Manager's Community
+Template Gallery Developer Terms of Service available at
+https://developers.google.com/tag-manager/gallery-tos (or such other URL as
+Google may provide), as modified from time to time.
+
+
+___INFO___
 
 {
   "type": "MACRO",
@@ -6,7 +14,7 @@
   "version": 1,
   "securityGroups": [],
   "displayName": "Server-side Session Management",
-  "description": "",
+  "description": "This template helps to manage sessions for GA4 on the server instead of the client. Use Firestore to persist a session for an own-defined timeframe. Add your Session IDs, Counter and Engagement Time.",
   "containerContexts": [
     "SERVER"
   ]
@@ -44,6 +52,46 @@ ___TEMPLATE_PARAMETERS___
     "groupStyle": "ZIPPY_OPEN",
     "subParams": [
       {
+        "type": "GROUP",
+        "name": "migrateSessionData",
+        "displayName": "Migrate sessions",
+        "groupStyle": "NO_ZIPPY",
+        "subParams": [
+          {
+            "type": "CHECKBOX",
+            "name": "migrateSessionId",
+            "checkboxText": "Take over existing session metrics for new users",
+            "simpleValueType": true
+          },
+          {
+            "type": "TEXT",
+            "name": "sessionId",
+            "displayName": "Variable with Session ID",
+            "simpleValueType": true,
+            "enablingConditions": [
+              {
+                "paramName": "migrateSessionId",
+                "paramValue": true,
+                "type": "EQUALS"
+              }
+            ]
+          },
+          {
+            "type": "TEXT",
+            "name": "sessionNumber",
+            "displayName": "Variable with Session Number",
+            "simpleValueType": true,
+            "enablingConditions": [
+              {
+                "paramName": "migrateSessionId",
+                "paramValue": true,
+                "type": "EQUALS"
+              }
+            ]
+          }
+        ]
+      },
+      {
         "type": "TEXT",
         "name": "sessionLength",
         "displayName": "Time differenz between hits that will cause new session (in minutes)",
@@ -66,6 +114,19 @@ ___TEMPLATE_PARAMETERS___
         "selectItems": [],
         "simpleValueType": true,
         "notSetText": "Use client ID of the event"
+      },
+      {
+        "type": "SELECT",
+        "name": "sessionIdInput",
+        "displayName": "Select the variabel which should be used as a session ID",
+        "macrosInSelect": true,
+        "selectItems": [
+          {
+            "value": "sessionIdInputTimestamp",
+            "displayValue": "Use current timestamp"
+          }
+        ],
+        "simpleValueType": true
       },
       {
         "type": "SELECT",
@@ -92,6 +153,14 @@ ___TEMPLATE_PARAMETERS___
           {
             "value": "data_mode",
             "displayValue": "Check if template storage is available"
+          },
+          {
+            "value": "system_properties",
+            "displayValue": "GA4 System Properties"
+          },
+          {
+            "value": "session_engaged",
+            "displayValue": "Session Engaged"
           }
         ],
         "simpleValueType": true,
@@ -165,6 +234,19 @@ ___TEMPLATE_PARAMETERS___
             "type": "EQUALS"
           }
         ]
+      },
+      {
+        "type": "TEXT",
+        "name": "sessionEngaged",
+        "displayName": "Time after which a second will count as engaged (in seconds)",
+        "simpleValueType": true,
+        "enablingConditions": [
+          {
+            "paramName": "returnValue",
+            "paramValue": "session_engaged",
+            "type": "EQUALS"
+          }
+        ]
       }
     ]
   }
@@ -183,14 +265,17 @@ const setResponseStatus = require('setResponseStatus');
 const templateDataStorage = require('templateDataStorage');
 const sha256Sync = require('sha256Sync');
 const makeString = require('makeString');
+const makeInteger = require('makeInteger');
 const encodeUriComponent = require('encodeUriComponent');
+const generateRandom = require('generateRandom');
 
 // temp
 const JSON = require('JSON');
 
-
 const firestoreCollection = data.firestoreCollection;
-const firestoreDocument = sha256Sync(data.clientId == null ? (getEventData('client_id') || "1234ac116785") : data.clientId, {outputEncoding: 'hex'});
+const firestoreDocument = sha256Sync(data.clientId == null ? getEventData('client_id') : data.clientId, {outputEncoding: 'hex'});
+if (!firestoreCollection||!firestoreDocument) return false;
+
 const currentTimestamp = getTimestampMillis();
 const sessionLength = data.sessionLength;
 const excludeEvents = data.excludeEvents || [];
@@ -209,16 +294,20 @@ let session_id,
 eventArray = (excludeEvents.length > 0) ? excludeEvents.filter(e => e.event_name == eventName) : [];
 eventArrayInclude = (includeEvents.length > 0) ? includeEvents.filter(e => e.event_name == eventName) : [];
 
-log("Collection is " + firestoreCollection + " and document is " + firestoreDocument);
-log("Current timestamp is " + currentTimestamp);
-
 let session = templateDataStorage.getItemCopy(firestoreDocument);
 if (session) {
   
-  log("Found session in storage");
   if ((currentTimestamp - session.last_timestamp) < (data.refreshTimeout * 1000) || (data.returnValue != "returnJson" && !data.activateRefresh && (currentTimestamp - session.last_timestamp) < (sessionLength * 60 * 1000))) {
-    session.engagement_time_msec = currentTimestamp - session.session_id;
+    
+    session.engagement_time_msec = currentTimestamp - session.last_timestamp;
+    session.last_timestamp = currentTimestamp;
+    templateDataStorage.setItemCopy(firestoreDocument, session);
+    
     session.data_mode = "storage";
+    
+    let sessionEngaged = data.sessionEngaged * 1000 || null;
+    session.session_engaged = (currentTimestamp - session.session_id*1000) > sessionEngaged ? 1 : null;
+    
     return data.returnValue == "returnJson" ? session : makeString(session[data.returnValue]);
   }
 }
@@ -235,72 +324,81 @@ return Firestore.query(firestoreCollection, queries, {
   projectId: data.gcpProject,
 }).then((documents) => {
   
-  let session_doc = {};
+  let session_doc = {}, 
+      migrationId, 
+      migrationNumber,
+      systemProperties = {};
   
+  if (data.migrateSessionId) {
+    migrationId = data.sessionId;
+    migrationNumber = data.sessionNumber;
+  }
+
   if (documents.length > 0) {
     
-    log('Found a user ' + JSON.stringify(documents[0].data));
-
     let result = documents[0].data;
     oldTimestamp = result.last_timestamp;
 
     if (!result.last_timestamp || (currentTimestamp - result.last_timestamp) > (sessionLength * 60 * 1000)) {
 
-      log("Starting a new session " + currentTimestamp);
-
-      session_doc.session_id = currentTimestamp;
+      session_doc.session_id = migrationId ? migrationId : (data.sessionIdInput == "sessionIdInputTimestamp" || !data.sessionIdInput || data.sessionIdInput === undefined || data.sessionIdInput === null) ? makeInteger(currentTimestamp / 1000) : data.sessionIdInput;
       session_doc.session_number = result.session_number + 1;
       session_doc.last_timestamp = currentTimestamp;
-      
+      session_doc.system_properties = {ss: 1};
+      session_doc.engagement_time_msec = 0;
+
       return storeInFirestore(session_doc, "new");
 
     } else {
-
-      log("Continuing an old session " + result.session_id);
       
+      let sessionEngaged = data.sessionEngaged * 1000 || null;
+
       session_doc = result;
       session_doc.last_timestamp = currentTimestamp;
+      session_doc.system_properties = null;
+      session_doc.engagement_time_msec = currentTimestamp - oldTimestamp;
+      session_doc.session_engaged = (currentTimestamp - result.session_id*1000) > sessionEngaged ? 1 : null;
 
       return storeInFirestore(session_doc);
       
     }
     
   } else {
-    
-    log("not found");
-
+        
     session_doc = {
       id: firestoreDocument,
-      session_id: currentTimestamp, 
+      session_id: migrationId ? migrationId : (data.sessionIdInput == "sessionIdInputTimestamp" || !data.sessionIdInput) ? makeInteger(currentTimestamp / 1000) : data.sessionIdInput, 
       last_timestamp: currentTimestamp,
-      session_number: 1
+      session_number: migrationNumber ? migrationNumber : 1,
+      engagement_time_msec: 0,
+      system_properties: {fv:1, ss: 1}
     };
     
     return storeInFirestore(session_doc, "new");
-
-
-//    return storeInFirestore(session_doc);
-
   }
 
     
 }, (e) => {
   
   log(e);
+  
+  let session_doc_error = {
+    session_id: null, 
+    last_timestamp: currentTimestamp,
+    session_number: null
+  };
+  
+  return data.returnValue == "returnJson" ? session_doc_error : session_doc_error[data.returnValue];
 
 });
 
 function storeInFirestore(input, status) {
   
   if (data.activateEvents && (eventArray.length > 0 || eventArrayInclude.length == 0)) return input.session_id;
-  
-  input.engagement_time_msec = currentTimestamp - input.session_id;
-  
+    
   if (data.returnValue != "returnJson" && !data.activateRefresh) return input[data.returnValue];
 
-  if ((currentTimestamp - oldTimestamp) > (data.refreshTimeout * 1000) || status == "new") {
-
-    log("Diff is " + (currentTimestamp - oldTimestamp) + ". Writing to Firestore...");
+  if (((currentTimestamp - oldTimestamp) > (data.refreshTimeout * 1000) || status == "new") &&  (data.returnValue != "session_number" && data.returnValue != "engagement_time_msec" && data.returnValue != "system_properties" && data.returnValue != "session_engaged")) {
     
     return Firestore.write(firestoreCollection + '/' + firestoreDocument, input, {
       projectId: data.gcpProject,
@@ -313,16 +411,17 @@ function storeInFirestore(input, status) {
 
       return data.returnValue == "returnJson" ? input : input[data.returnValue];
 
-      // return returnValue(session_doc);
+    }, (e) => {
+
+      return data.returnValue == "returnJson" ? input : input[data.returnValue];
+
     });
 
   } else {
-    log("Diff is " + (currentTimestamp - oldTimestamp) + ". Not writing to Firestore...");
+
     input.data_mode = "no refresh";
     templateDataStorage.setItemCopy(firestoreDocument, input);
     
-    log("input is " + JSON.stringify(input) + " \nreturn value is " + input[data.returnValue]);
-
     return data.returnValue == "returnJson" ? input : input[data.returnValue];
   }
   
@@ -495,6 +594,6 @@ scenarios: []
 
 ___NOTES___
 
-Created on 10.2.2023, 11:44:35
+Created on 24.2.2023, 15:06:26
 
 
